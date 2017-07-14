@@ -16,6 +16,10 @@
 
 package io.grpc.benchmarks.driver;
 
+import com.google.api.gax.grpc.ApiStreamObserver;
+import com.google.api.gax.grpc.ChannelProvider;
+import com.google.api.gax.grpc.FixedChannelProvider;
+import com.google.api.gax.grpc.StreamingCallable;
 import com.sun.management.OperatingSystemMXBean;
 import io.grpc.CallOptions;
 import io.grpc.Channel;
@@ -25,6 +29,8 @@ import io.grpc.Metadata;
 import io.grpc.Status;
 import io.grpc.benchmarks.Transport;
 import io.grpc.benchmarks.Utils;
+import io.grpc.benchmarks.gapic.BenchmarkServiceClient;
+import io.grpc.benchmarks.gapic.BenchmarkServiceSettings;
 import io.grpc.benchmarks.proto.BenchmarkServiceGrpc;
 import io.grpc.benchmarks.proto.Control;
 import io.grpc.benchmarks.proto.Messages;
@@ -36,6 +42,11 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.epoll.Epoll;
 import io.netty.util.concurrent.DefaultThreadFactory;
+import org.HdrHistogram.Histogram;
+import org.HdrHistogram.LogarithmicIterator;
+import org.HdrHistogram.Recorder;
+import org.apache.commons.math3.distribution.ExponentialDistribution;
+
 import java.lang.management.ManagementFactory;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
@@ -46,10 +57,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import org.HdrHistogram.Histogram;
-import org.HdrHistogram.LogarithmicIterator;
-import org.HdrHistogram.Recorder;
-import org.apache.commons.math3.distribution.ExponentialDistribution;
 
 /**
  * Implements the client-side contract for the load testing scenarios.
@@ -67,6 +74,7 @@ class LoadClient {
   ManagedChannel[] channels;
   BenchmarkServiceGrpc.BenchmarkServiceBlockingStub[] blockingStubs;
   BenchmarkServiceGrpc.BenchmarkServiceStub[] asyncStubs;
+  private BenchmarkServiceClient[] gapicClients;
   Recorder recorder;
   private ExecutorService fixedThreadPool;
   private Messages.SimpleRequest simpleRequest;
@@ -94,18 +102,24 @@ class LoadClient {
     }
 
     // Create a stub per channel
-    if (config.getClientType() == Control.ClientType.ASYNC_CLIENT) {
-      asyncStubs = new BenchmarkServiceGrpc.BenchmarkServiceStub[channels.length];
-      for (int i = 0; i < channels.length; i++) {
-        asyncStubs[i] = BenchmarkServiceGrpc.newStub(channels[i]);
-      }
-    } else {
-      blockingStubs = new BenchmarkServiceGrpc.BenchmarkServiceBlockingStub[channels.length];
-      for (int i = 0; i < channels.length; i++) {
-        blockingStubs[i] = BenchmarkServiceGrpc.newBlockingStub(channels[i]);
-      }
-    }
+//    if (config.getClientType() == Control.ClientType.ASYNC_CLIENT) {
+//      asyncStubs = new BenchmarkServiceGrpc.BenchmarkServiceStub[channels.length];
+//      for (int i = 0; i < channels.length; i++) {
+//        asyncStubs[i] = BenchmarkServiceGrpc.newStub(channels[i]);
+//      }
+//    } else {
+//      blockingStubs = new BenchmarkServiceGrpc.BenchmarkServiceBlockingStub[channels.length];
+//      for (int i = 0; i < channels.length; i++) {
+//        blockingStubs[i] = BenchmarkServiceGrpc.newBlockingStub(channels[i]);
+//      }
+//    }
 
+    gapicClients = new BenchmarkServiceClient[channels.length];
+    for (int i = 0; i < channels.length; i++) {
+      ChannelProvider channelProvider = FixedChannelProvider.create(channels[i]);
+      BenchmarkServiceSettings settings = BenchmarkServiceSettings.defaultBuilder().setChannelProvider(channelProvider).build();
+      gapicClients[i] = BenchmarkServiceClient.create();
+    }
     // Determine no of threads
     if (config.getClientType() == Control.ClientType.SYNC_CLIENT) {
       threadCount = config.getOutstandingRpcsPerChannel() * config.getClientChannels();
@@ -186,7 +200,8 @@ class LoadClient {
             if (config.getRpcType() == Control.RpcType.UNARY) {
               r = new AsyncUnaryWorker(asyncStubs[i % asyncStubs.length]);
             } else if (config.getRpcType() == Control.RpcType.STREAMING) {
-              r = new AsyncPingPongWorker(asyncStubs[i % asyncStubs.length]);
+//              r = new AsyncPingPongWorker(asyncStubs[i % asyncStubs.length]);
+              r = new GapicAsyncPingPongWorker(gapicClients[i % gapicClients.length]);
             }
           }
           break;
@@ -379,6 +394,7 @@ class LoadClient {
     public void run() {
       while (!shutdown) {
         maxOutstanding.acquireUninterruptibly();
+
         final AtomicReference<StreamObserver<Messages.SimpleRequest>> requestObserver =
             new AtomicReference<StreamObserver<Messages.SimpleRequest>>();
         requestObserver.set(stub.streamingCall(
@@ -410,8 +426,64 @@ class LoadClient {
                 maxOutstanding.release();
               }
             }));
+
         requestObserver.get().onNext(simpleRequest);
       }
+    }
+  }
+
+  /**
+   * Worker which executes a streaming ping-pong call. Event timing is the duration between
+   * sending the ping and receiving the pong.
+   */
+  private class GapicAsyncPingPongWorker implements Runnable {
+    final Semaphore maxOutstanding = new Semaphore(config.getOutstandingRpcsPerChannel());
+    final BenchmarkServiceClient gapicClient;
+
+    GapicAsyncPingPongWorker(BenchmarkServiceClient gapicClient) {
+      this.gapicClient = gapicClient;
+    }
+
+    @Override
+    public void run() {
+//      while (!shutdown) {
+        maxOutstanding.acquireUninterruptibly();
+
+        StreamingCallable<Messages.SimpleRequest, Messages.SimpleResponse> callable = gapicClient.streamingCallCallable();
+
+        final AtomicReference<ApiStreamObserver<Messages.SimpleRequest>> requestObserver =
+            new AtomicReference<ApiStreamObserver<Messages.SimpleRequest>>();
+        requestObserver.set(callable.bidiStreamingCall(
+            new ApiStreamObserver<Messages.SimpleResponse>() {
+              long now = System.nanoTime();
+
+              @Override
+              public void onNext(Messages.SimpleResponse value) {
+                delay(System.nanoTime() - now);
+                if (shutdown) {
+                  requestObserver.get().onCompleted();
+                  // Must not send another request.
+                  return;
+                }
+                requestObserver.get().onNext(simpleRequest);
+                now = System.nanoTime();
+              }
+
+              @Override
+              public void onError(Throwable t) {
+                maxOutstanding.release();
+                Level level = shutdown ? Level.FINE : Level.INFO;
+                log.log(level, "Error in Async Ping-Pong call", t);
+
+              }
+
+              @Override
+              public void onCompleted() {
+                maxOutstanding.release();
+              }
+            }));
+        requestObserver.get().onNext(simpleRequest);
+//      }
     }
   }
 

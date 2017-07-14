@@ -17,6 +17,9 @@ plugins {
 
 apply plugin: 'application'
 
+sourceCompatibility = 1.7
+targetCompatibility = 1.7
+
 description = "grpc Benchmarks"
 
 startScripts.enabled = false
@@ -42,7 +45,11 @@ dependencies {
             libraries.hdrhistogram,
             libraries.netty_tcnative,
             libraries.netty_epoll,
-            libraries.math
+            libraries.math,
+            libraries.protobuf,
+            libraries.guava,
+            'com.google.api:gax:1.4.1',
+            'com.google.api:gax-grpc:0.21.1'
 }
 
 compileJmhJava {
